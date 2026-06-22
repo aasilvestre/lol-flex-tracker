@@ -1,108 +1,185 @@
-# 🏆 LoL Challenger/GM Tracker — Flex BR (versão cloud)
+# 🏆 LoL Flex Tracker — v1.0
 
-Monitora automaticamente quantos jogadores Challenger e Grão-Mestre estão em
-partida de Ranqueada Flex (BR1) a cada hora. Os dados ficam versionados no
-próprio repositório e o dashboard é servido gratuitamente pelo Streamlit Cloud.
-
-```
-GitHub Actions (coleta horária)
-        │  commita data/snapshots.csv
-        ▼
-GitHub Repository
-        │  lê o CSV
-        ▼
-Streamlit Community Cloud (dashboard público ou privado)
-```
+Monitora automaticamente a atividade dos jogadores **Challenger e Grão-Mestre** na fila **Ranqueada Flex (BR1)**, identificando os horários e dias da semana com maior presença de jogadores de elite — para você evitar essas janelas e subir mais tranquilo.
 
 ---
 
-## Pré-requisitos
+## Como funciona
 
-- Conta no **GitHub** (gratuita)
-- **Personal API Key da Riot** (não expira — solicite em https://developer.riotgames.com/)
-- Conta no **Streamlit Community Cloud** — cadastro em https://share.streamlit.io (gratuito, faz login com o GitHub)
+```
+cron-job.org (todo :00)
+    → dispara GitHub Actions via API
+        → collector.py roda (~15 min)
+            → commita data/ no repositório
+                → Streamlit Cloud atualiza o dashboard
+```
+
+Dois sinais são coletados a cada hora:
+
+| Sinal | Como funciona |
+|-------|--------------|
+| **Partidas ao vivo** | Spectator API verifica se cada jogador está em partida Flex no momento |
+| **Jogos por delta de LP** | Compara o LP atual de cada jogador com o snapshot anterior — qualquer variação indica que um jogo aconteceu no intervalo |
+
+Os dois sinais se complementam: o delta de LP captura jogos que terminaram entre coletas, enquanto a Spectator API captura quem está jogando agora.
 
 ---
 
-## Passo 1 — Criar o repositório no GitHub
-
-1. Acesse https://github.com/new
-2. Nome sugerido: `lol-flex-tracker`
-3. Pode ser **público** ou **privado** — com repositório público o GitHub Actions
-   tem minutos ilimitados no plano gratuito; privado tem 2.000 min/mês (suficiente
-   para coleta horária).
-4. Crie o repositório e faça upload de todos estes arquivos mantendo a estrutura:
+## Estrutura do projeto
 
 ```
 lol-flex-tracker/
 ├── .github/
 │   └── workflows/
-│       └── collect.yml
+│       └── main.yml          # Workflow do GitHub Actions
 ├── data/
-│   └── snapshots.csv      ← começa só com o cabeçalho; os dados acumulam aqui
-├── collector.py
-├── dashboard.py
-└── requirements.txt
+│   ├── snapshots.csv         # Um registro por hora (agregado)
+│   └── player_lp.csv         # LP de cada jogador por hora (~700 linhas/hora)
+├── collector.py              # Script de coleta (roda no GitHub Actions)
+├── dashboard.py              # Dashboard Streamlit
+├── requirements.txt          # Dependências Python
+└── README.md
 ```
 
----
+### Colunas do `snapshots.csv`
 
-## Passo 2 — Adicionar a API Key como secret
-
-1. No seu repositório, vá em **Settings → Secrets and variables → Actions**.
-2. Clique em **New repository secret**.
-3. Nome: `RIOT_API_KEY`
-4. Valor: sua Personal API Key da Riot (começa com `RGAPI-...`)
-5. Salve.
-
-> A chave fica criptografada no GitHub e nunca aparece nos logs nem no código.
-
----
-
-## Passo 3 — Ativar o GitHub Actions
-
-O workflow já está configurado para rodar automaticamente todo início de hora.
-Para testar imediatamente sem esperar:
-
-1. Vá na aba **Actions** do repositório.
-2. Clique no workflow **"Coletar dados Challenger/GM Flex BR"**.
-3. Clique em **"Run workflow"** → **"Run workflow"** (botão verde).
-4. Acompanhe os logs em tempo real. A execução leva alguns minutos (o coletor
-   precisa checar centenas de jogadores respeitando o rate limit da API).
-5. Após concluir, veja em `data/snapshots.csv` — haverá uma nova linha.
+| Coluna | Descrição |
+|--------|-----------|
+| `timestamp_utc` | Data/hora da coleta em UTC |
+| `players_in_game` | Jogadores em partida Flex ao vivo |
+| `total_tracked` | Total de jogadores verificados no ciclo |
+| `challenger_count` | Quantidade de Challengers no BR naquele momento |
+| `gm_count` | Quantidade de Grão-Mestres no BR naquele momento |
+| `games_detected_by_lp` | Jogadores cujo LP mudou desde o snapshot anterior |
+| `lp_wins_detected` | Subconjunto: LP subiu (vitória provável) |
+| `lp_losses_detected` | Subconjunto: LP caiu (derrota provável) |
 
 ---
 
-## Passo 4 — Hospedar o dashboard no Streamlit Community Cloud
+## Serviços utilizados (todos gratuitos)
 
-1. Acesse https://share.streamlit.io e entre com sua conta GitHub.
-2. Clique em **"New app"**.
+| Serviço | Função |
+|---------|--------|
+| **Riot Games API** | Dados de Challenger/GM e Spectator |
+| **GitHub** | Repositório + execução do collector (Actions) |
+| **cron-job.org** | Agendamento confiável (dispara o workflow toda hora) |
+| **Streamlit Community Cloud** | Dashboard público |
+
+---
+
+## Setup completo do zero
+
+### Pré-requisitos
+- Conta no GitHub
+- Conta no Streamlit Community Cloud (login com GitHub em https://share.streamlit.io)
+- Conta no cron-job.org (https://cron-job.org)
+- API Key da Riot Games (https://developer.riotgames.com)
+
+> **Recomendado:** solicitar a **Personal API Key** no portal da Riot (gratuita, não expira). A chave de desenvolvimento expira a cada 24h e precisa ser trocada manualmente no secret do GitHub.
+
+---
+
+### Passo 1 — Criar o repositório no GitHub
+
+1. Acesse https://github.com/new
+2. Nome: `lol-flex-tracker` (pode ser público ou privado)
+3. Faça upload de todos os arquivos mantendo a estrutura de pastas
+
+---
+
+### Passo 2 — Adicionar a API Key como secret
+
+1. No repositório: **Settings → Secrets and variables → Actions**
+2. **New repository secret**
+3. Nome: `RIOT_API_KEY` / Valor: sua chave `RGAPI-...`
+
+> Se estiver usando a chave de desenvolvimento (expira em 24h): repita esse passo todo dia gerando uma nova chave em https://developer.riotgames.com e atualizando o secret.
+
+---
+
+### Passo 3 — Configurar o cron-job.org
+
+1. Cadastre-se em https://cron-job.org
+2. **Create cronjob** com as seguintes configurações:
+
+**Aba principal:**
+| Campo | Valor |
+|-------|-------|
+| Title | `LoL Flex Tracker` |
+| URL | `https://api.github.com/repos/SEU_USUARIO/lol-flex-tracker/actions/workflows/main.yml/dispatches` |
+| Execution schedule | Every 1 hour |
+
+**Aba Advanced → Headers** (adicionar 3 headers):
+| Key | Value |
+|-----|-------|
+| `Authorization` | `Bearer ghp_SEU_TOKEN_AQUI` |
+| `Accept` | `application/vnd.github+json` |
+| `Content-Type` | `application/json` |
+
+**Aba Advanced → Request body:**
+```json
+{"ref":"main"}
+```
+
+**Aba Advanced → Request method:** `POST`
+
+3. Salve e clique em **Test run** — deve retornar **204 No Content**
+
+> O token usado aqui é um **Personal Access Token (PAT)** do GitHub, não a API Key da Riot. Gere um em: GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic) → escopo `workflow`.
+
+---
+
+### Passo 4 — Hospedar o dashboard no Streamlit Community Cloud
+
+1. Acesse https://share.streamlit.io
+2. **New app**
 3. Preencha:
-   - **Repository:** `seu-usuario/lol-flex-tracker`
-   - **Branch:** `main`
-   - **Main file path:** `dashboard.py`
-4. Clique em **"Deploy"**.
-5. Em alguns minutos, você terá uma URL pública (ex:
-   `https://seu-usuario-lol-flex-tracker.streamlit.app`) com o dashboard
-   atualizado automaticamente a cada push (ou seja, a cada coleta horária).
+   - Repository: `seu-usuario/lol-flex-tracker`
+   - Branch: `main`
+   - Main file path: `dashboard.py`
+4. **Deploy**
+
+Em alguns minutos o dashboard estará disponível em uma URL pública.
 
 ---
 
-## Como os dados crescem
+## Manutenção
 
-Cada execução do Actions acrescenta **1 linha** ao CSV. Em um mês de coleta
-contínua (24 execuções/dia × 30 dias) você terá ~720 linhas — um arquivo
-pequeno (~50 KB), sem nenhum problema para o git.
+### Trocar a API Key (chave de desenvolvimento, expira a cada 24h)
+1. Acesse https://developer.riotgames.com e copie a nova chave
+2. GitHub → Settings → Secrets and variables → Actions → `RIOT_API_KEY` → Update secret
+3. Cole a nova chave e salve
+
+### Verificar se a coleta está rodando
+- Aba **Actions** do repositório: deve ter um novo run a cada hora com label `workflow_dispatch`
+- O arquivo `data/snapshots.csv` deve ganhar uma linha nova por hora
+
+### Pausar a coleta
+- No cron-job.org: desative o job com o toggle **Enable job**
+- Ou no GitHub: Actions → selecione o workflow → **Disable workflow**
+
+### Rodar manualmente
+- GitHub → aba **Actions** → **Coletar dados Challenger/GM Flex BR** → **Run workflow**
 
 ---
 
-## Dicas
+## Limitações conhecidas
 
-- **Forçar uma coleta manual:** aba Actions → Run workflow.
-- **Pausar a coleta:** aba Actions → selecione o workflow → "Disable workflow".
-- **Ver os dados brutos:** abra `data/snapshots.csv` diretamente no GitHub.
-- **Rodar o dashboard localmente:**
-  ```bash
-  pip install -r requirements.txt
-  streamlit run dashboard.py
-  ```
+- **Granularidade de 1 hora:** jogadores que jogaram múltiplas partidas no intervalo aparecem como "1 jogo detectado" no delta de LP. O padrão acumulado ao longo de semanas continua preciso.
+- **Detecção ao vivo:** a Spectator API só mostra partidas em andamento, não jogadores procurando partida.
+- **Rate limit:** com a Personal API Key, cada ciclo completo leva ~15 minutos. Com a chave de desenvolvimento o comportamento é similar, mas com mais risco de throttling.
+- **Buracos de dados:** se a chave expirar ou o workflow falhar, haverá ausência de dados naquele período.
+
+---
+
+## Dashboard
+
+O dashboard possui 4 abas:
+
+| Aba | Conteúdo |
+|-----|----------|
+| 🔥 Heatmap | Mapa de calor dia × hora com atividade combinada (ao vivo + delta LP) |
+| 📈 Série temporal | Evolução dos dois sinais ao longo do tempo |
+| ⚔️ Análise de LP | Jogos detectados por variação de LP, vitórias/derrotas inferidas |
+| 🗃️ Dados brutos | Últimos 30 snapshots com todas as colunas |
+

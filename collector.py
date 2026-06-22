@@ -73,7 +73,7 @@ def resolve_puuid(summoner_id: str) -> str | None:
 
 
 def is_in_flex_game(puuid: str) -> bool:
-    url = f"{BASE_URL}/lol/spectator/v5/by-summoner/{puuid}"
+    url = f"{BASE_URL}/lol/spectator/v5/active-games/by-summoner/{puuid}"
     resp = get_with_retry(url)
     time.sleep(CALL_DELAY)
     if resp.status_code == 404:

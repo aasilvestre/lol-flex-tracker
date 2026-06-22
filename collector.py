@@ -1,9 +1,12 @@
 """
-Coleta um snapshot dos jogadores Challenger/Grão-Mestre da fila Flex (BR1)
-que estão em partida no momento e acrescenta uma linha em data/snapshots.csv.
+Coleta um snapshot dos jogadores Challenger/Grão-Mestre da fila Flex (BR1):
+  1. Registra quantos estão em partida ativa (Spectator API)
+  2. Registra o LP atual de cada jogador e compara com o snapshot anterior
+     para detectar jogos que ocorreram no intervalo entre coletas.
 
-Projetado para ser chamado pelo GitHub Actions uma vez por hora — não entra
-em loop; termina após o único ciclo de varredura.
+Arquivos gerados/atualizados:
+  data/snapshots.csv   — uma linha por ciclo (agregado)
+  data/player_lp.csv   — uma linha por jogador por ciclo (histórico de LP)
 """
 
 import csv
@@ -16,31 +19,34 @@ import requests
 
 API_KEY = os.environ.get("RIOT_API_KEY", "")
 if not API_KEY:
-    raise SystemExit(
-        "Variável de ambiente RIOT_API_KEY não definida. "
-        "Defina-a como secret no GitHub Actions ou no seu .env local."
-    )
+    raise SystemExit("Variável RIOT_API_KEY não definida.")
 
 PLATFORM      = "br1"
 QUEUE         = "RANKED_FLEX_SR"
 FLEX_QUEUE_ID = 440
-
-CSV_PATH   = Path(__file__).parent / "data" / "snapshots.csv"
-CSV_HEADER = ["timestamp_utc", "players_in_game", "total_tracked", "challenger_count", "gm_count"]
-
-# Delay conservador entre chamadas individuais para respeitar 100 req/2 min
-CALL_DELAY = 1.3
+CALL_DELAY    = 1.3
 
 BASE_URL = f"https://{PLATFORM}.api.riotgames.com"
 
+DATA_DIR         = Path(__file__).parent / "data"
+SNAPSHOTS_CSV    = DATA_DIR / "snapshots.csv"
+PLAYER_LP_CSV    = DATA_DIR / "player_lp.csv"
+
+SNAPSHOTS_HEADER = [
+    "timestamp_utc", "players_in_game", "total_tracked",
+    "challenger_count", "gm_count",
+    "games_detected_by_lp",   # jogadores cujo LP mudou desde o snapshot anterior
+    "lp_wins_detected",       # subconjunto: LP subiu  (provável vitória)
+    "lp_losses_detected",     # subconjunto: LP caiu   (provável derrota)
+]
+PLAYER_LP_HEADER = ["timestamp_utc", "puuid", "tier", "lp"]
+
 session = requests.Session()
 session.headers.update({"X-Riot-Token": API_KEY})
-
 start_time = time.time()
 
 
 def elapsed() -> str:
-    """Retorna o tempo decorrido desde o início do script, ex: '2m14s'."""
     s = int(time.time() - start_time)
     return f"{s // 60}m{s % 60:02d}s"
 
@@ -59,8 +65,7 @@ def get_with_retry(url: str, max_retries: int = 6) -> requests.Response:
             print(f"  [{elapsed()}] HTTP {resp.status_code} transitório, tentativa {attempt+1}/{max_retries}...", flush=True)
             time.sleep(3 * (attempt + 1))
             continue
-        # Qualquer outro status (403, 401, etc.) — loga e retorna para tratamento
-        print(f"  [{elapsed()}] HTTP {resp.status_code} inesperado em {url}", flush=True)
+        print(f"  [{elapsed()}] HTTP {resp.status_code} inesperado: {url}", flush=True)
         return resp
     raise RuntimeError(f"Falha após {max_retries} tentativas: {url}")
 
@@ -70,15 +75,6 @@ def fetch_league(tier_url: str) -> list[dict]:
     resp.raise_for_status()
     time.sleep(CALL_DELAY)
     return resp.json().get("entries", [])
-
-
-def resolve_puuid(summoner_id: str) -> str | None:
-    url = f"{BASE_URL}/lol/summoner/v4/summoners/{summoner_id}"
-    resp = get_with_retry(url)
-    time.sleep(CALL_DELAY)
-    if resp.status_code != 200:
-        return None
-    return resp.json().get("puuid")
 
 
 def is_in_flex_game(puuid: str) -> bool:
@@ -92,20 +88,47 @@ def is_in_flex_game(puuid: str) -> bool:
     return resp.json().get("gameQueueConfigId") == FLEX_QUEUE_ID
 
 
-def ensure_csv():
-    CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not CSV_PATH.exists():
-        with CSV_PATH.open("w", newline="") as f:
-            csv.writer(f).writerow(CSV_HEADER)
+def ensure_csvs():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not SNAPSHOTS_CSV.exists():
+        with SNAPSHOTS_CSV.open("w", newline="") as f:
+            csv.writer(f).writerow(SNAPSHOTS_HEADER)
+    if not PLAYER_LP_CSV.exists():
+        with PLAYER_LP_CSV.open("w", newline="") as f:
+            csv.writer(f).writerow(PLAYER_LP_HEADER)
 
 
-def append_snapshot(timestamp: str, in_game: int, total: int, n_chall: int, n_gm: int):
-    with CSV_PATH.open("a", newline="") as f:
-        csv.writer(f).writerow([timestamp, in_game, total, n_chall, n_gm])
+def load_previous_lp() -> dict[str, int]:
+    """Lê o LP mais recente de cada jogador do player_lp.csv."""
+    if not PLAYER_LP_CSV.exists():
+        return {}
+    prev: dict[str, int] = {}
+    with PLAYER_LP_CSV.open(newline="") as f:
+        for row in csv.DictReader(f):
+            prev[row["puuid"]] = int(row["lp"])   # sobrescreve → fica o mais recente
+    return prev
+
+
+def save_player_lp(ts: str, players: list[tuple[str, str, int]]):
+    """Acrescenta linhas (timestamp, puuid, tier, lp) ao player_lp.csv."""
+    with PLAYER_LP_CSV.open("a", newline="") as f:
+        w = csv.writer(f)
+        for puuid, tier, lp in players:
+            w.writerow([ts, puuid, tier, lp])
+
+
+def save_snapshot(ts: str, in_game: int, total: int,
+                  n_chall: int, n_gm: int,
+                  games_lp: int, wins_lp: int, losses_lp: int):
+    with SNAPSHOTS_CSV.open("a", newline="") as f:
+        csv.writer(f).writerow([
+            ts, in_game, total, n_chall, n_gm,
+            games_lp, wins_lp, losses_lp,
+        ])
 
 
 def main():
-    ensure_csv()
+    ensure_csvs()
 
     print(f"[{elapsed()}] Buscando lista Challenger + Grão-Mestre (Flex BR)...", flush=True)
     challengers = fetch_league(f"{BASE_URL}/lol/league/v4/challengerleagues/by-queue/{QUEUE}")
@@ -113,47 +136,76 @@ def main():
 
     total = len(challengers) + len(gm_players)
     print(f"[{elapsed()}] Challenger: {len(challengers)} | Grão-Mestre: {len(gm_players)} | Total: {total}", flush=True)
-    print(f"[{elapsed()}] Tempo estimado para varredura completa: ~{int(total * CALL_DELAY // 60)}m{int(total * CALL_DELAY % 60):02d}s", flush=True)
-    print(f"[{elapsed()}] Iniciando verificação de partidas ativas...", flush=True)
+    print(f"[{elapsed()}] Tempo estimado: ~{int(total * CALL_DELAY // 60)}m{int(total * CALL_DELAY % 60):02d}s", flush=True)
+
+    # Carrega LP do snapshot anterior para comparação
+    prev_lp = load_previous_lp()
+    is_first_run = len(prev_lp) == 0
+    if is_first_run:
+        print(f"[{elapsed()}] Primeira execução — sem LP anterior para comparar. Próximo ciclo já terá delta.", flush=True)
+    else:
+        print(f"[{elapsed()}] LP anterior carregado para {len(prev_lp)} jogadores.", flush=True)
 
     all_players = [(e, "challenger") for e in challengers] + [(e, "gm") for e in gm_players]
-    in_game  = 0
-    checked  = 0
-    errors   = 0
 
-    # Intervalo de progresso: a cada 50 jogadores
+    in_game      = 0
+    checked      = 0
+    errors       = 0
+    games_lp     = 0   # jogadores com delta de LP != 0
+    wins_lp      = 0   # LP subiu
+    losses_lp    = 0   # LP caiu
+    current_lp_snapshot: list[tuple[str, str, int]] = []
+
     LOG_INTERVAL = 50
 
     for i, (entry, tier) in enumerate(all_players, start=1):
-        puuid = entry.get("puuid") or resolve_puuid(entry["summonerId"])
+        puuid = entry.get("puuid")
+        lp    = entry.get("leaguePoints", 0)
+
         if puuid is None:
             errors += 1
             continue
 
+        # Registra LP atual
+        current_lp_snapshot.append((puuid, tier, lp))
+
+        # Detecta delta de LP em relação ao snapshot anterior
+        if not is_first_run and puuid in prev_lp:
+            delta = lp - prev_lp[puuid]
+            if delta > 0:
+                games_lp  += 1
+                wins_lp   += 1
+            elif delta < 0:
+                games_lp  += 1
+                losses_lp += 1
+            # delta == 0 → nenhum jogo detectado nesse intervalo para esse jogador
+
         checked += 1
-        playing = is_in_flex_game(puuid)
-        if playing:
+
+        # Verifica se está em partida agora
+        if is_in_flex_game(puuid):
             in_game += 1
 
-        # Log de progresso a cada LOG_INTERVAL jogadores
         if checked % LOG_INTERVAL == 0 or i == len(all_players):
-            pct     = checked / total * 100
-            eta_s   = int((total - checked) * CALL_DELAY)
+            eta_s = int((total - checked) * CALL_DELAY)
             print(
-                f"[{elapsed()}] {checked}/{total} ({pct:.0f}%) — "
-                f"em jogo: {in_game} | erros: {errors} | "
-                f"ETA: ~{eta_s // 60}m{eta_s % 60:02d}s",
+                f"[{elapsed()}] {checked}/{total} ({checked/total*100:.0f}%) — "
+                f"em jogo agora: {in_game} | jogos detectados (LP): {games_lp} "
+                f"(+{wins_lp}W / -{losses_lp}L) | ETA: ~{eta_s//60}m{eta_s%60:02d}s",
                 flush=True,
             )
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    append_snapshot(ts, in_game, checked, len(challengers), len(gm_players))
+    save_player_lp(ts, current_lp_snapshot)
+    save_snapshot(ts, in_game, checked, len(challengers), len(gm_players),
+                  games_lp, wins_lp, losses_lp)
 
-    print(f"", flush=True)
-    print(f"[{elapsed()}] ✅ Concluído!", flush=True)
-    print(f"[{elapsed()}] Jogadores em partida Flex agora: {in_game}/{checked}", flush=True)
-    print(f"[{elapsed()}] Erros/sem PUUID: {errors}", flush=True)
-    print(f"[{elapsed()}] Snapshot salvo em {CSV_PATH}", flush=True)
+    print(f"\n[{elapsed()}] ✅ Concluído!", flush=True)
+    print(f"[{elapsed()}] Em partida Flex agora:        {in_game}/{checked}", flush=True)
+    if not is_first_run:
+        print(f"[{elapsed()}] Jogos detectados por LP:     {games_lp}  (+{wins_lp}W / -{losses_lp}L)", flush=True)
+    print(f"[{elapsed()}] Erros/sem PUUID:              {errors}", flush=True)
+    print(f"[{elapsed()}] Snapshot salvo.", flush=True)
 
 
 if __name__ == "__main__":

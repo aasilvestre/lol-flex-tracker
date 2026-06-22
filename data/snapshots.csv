@@ -1,3 +1,1 @@
-timestamp_utc,players_in_game,total_tracked,challenger_count,gm_count
-2026-06-22T03:36:52,30,700,200,500
-2026-06-22T09:33:20,0,700,200,500
+timestamp_utc,players_in_game,total_tracked,challenger_count,gm_count,games_detected_by_lp,lp_wins_detected,lp_losses_detected

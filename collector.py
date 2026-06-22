@@ -21,21 +21,28 @@ if not API_KEY:
         "Defina-a como secret no GitHub Actions ou no seu .env local."
     )
 
-PLATFORM   = "br1"
-QUEUE      = "RANKED_FLEX_SR"
+PLATFORM      = "br1"
+QUEUE         = "RANKED_FLEX_SR"
 FLEX_QUEUE_ID = 440
 
-CSV_PATH = Path(__file__).parent / "data" / "snapshots.csv"
+CSV_PATH   = Path(__file__).parent / "data" / "snapshots.csv"
 CSV_HEADER = ["timestamp_utc", "players_in_game", "total_tracked", "challenger_count", "gm_count"]
 
-# Delay conservador entre chamadas individuais (chave personal: ~20 req/s,
-# mas vamos ser cuidadosos para não estourar o limite de 100 req/2 min).
+# Delay conservador entre chamadas individuais para respeitar 100 req/2 min
 CALL_DELAY = 1.3
 
 BASE_URL = f"https://{PLATFORM}.api.riotgames.com"
 
 session = requests.Session()
 session.headers.update({"X-Riot-Token": API_KEY})
+
+start_time = time.time()
+
+
+def elapsed() -> str:
+    """Retorna o tempo decorrido desde o início do script, ex: '2m14s'."""
+    s = int(time.time() - start_time)
+    return f"{s // 60}m{s % 60:02d}s"
 
 
 def get_with_retry(url: str, max_retries: int = 6) -> requests.Response:
@@ -45,13 +52,15 @@ def get_with_retry(url: str, max_retries: int = 6) -> requests.Response:
             return resp
         if resp.status_code == 429:
             wait = int(resp.headers.get("Retry-After", "10")) + 2
-            print(f"  Rate limit — aguardando {wait}s...")
+            print(f"  [{elapsed()}] Rate limit — aguardando {wait}s...", flush=True)
             time.sleep(wait)
             continue
         if resp.status_code in (500, 502, 503, 504):
+            print(f"  [{elapsed()}] HTTP {resp.status_code} transitório, tentativa {attempt+1}/{max_retries}...", flush=True)
             time.sleep(3 * (attempt + 1))
             continue
-        print(f"  HTTP {resp.status_code} em {url}")
+        # Qualquer outro status (403, 401, etc.) — loga e retorna para tratamento
+        print(f"  [{elapsed()}] HTTP {resp.status_code} inesperado em {url}", flush=True)
         return resp
     raise RuntimeError(f"Falha após {max_retries} tentativas: {url}")
 
@@ -98,28 +107,53 @@ def append_snapshot(timestamp: str, in_game: int, total: int, n_chall: int, n_gm
 def main():
     ensure_csv()
 
-    print("Buscando lista Challenger + Grão-Mestre (Flex BR)...")
+    print(f"[{elapsed()}] Buscando lista Challenger + Grão-Mestre (Flex BR)...", flush=True)
     challengers = fetch_league(f"{BASE_URL}/lol/league/v4/challengerleagues/by-queue/{QUEUE}")
     gm_players  = fetch_league(f"{BASE_URL}/lol/league/v4/grandmasterleagues/by-queue/{QUEUE}")
 
-    print(f"Challenger: {len(challengers)} | Grão-Mestre: {len(gm_players)}")
+    total = len(challengers) + len(gm_players)
+    print(f"[{elapsed()}] Challenger: {len(challengers)} | Grão-Mestre: {len(gm_players)} | Total: {total}", flush=True)
+    print(f"[{elapsed()}] Tempo estimado para varredura completa: ~{int(total * CALL_DELAY // 60)}m{int(total * CALL_DELAY % 60):02d}s", flush=True)
+    print(f"[{elapsed()}] Iniciando verificação de partidas ativas...", flush=True)
 
     all_players = [(e, "challenger") for e in challengers] + [(e, "gm") for e in gm_players]
-    in_game = 0
-    checked = 0
+    in_game  = 0
+    checked  = 0
+    errors   = 0
 
-    for entry, _ in all_players:
+    # Intervalo de progresso: a cada 50 jogadores
+    LOG_INTERVAL = 50
+
+    for i, (entry, tier) in enumerate(all_players, start=1):
         puuid = entry.get("puuid") or resolve_puuid(entry["summonerId"])
         if puuid is None:
+            errors += 1
             continue
+
         checked += 1
-        if is_in_flex_game(puuid):
+        playing = is_in_flex_game(puuid)
+        if playing:
             in_game += 1
+
+        # Log de progresso a cada LOG_INTERVAL jogadores
+        if checked % LOG_INTERVAL == 0 or i == len(all_players):
+            pct     = checked / total * 100
+            eta_s   = int((total - checked) * CALL_DELAY)
+            print(
+                f"[{elapsed()}] {checked}/{total} ({pct:.0f}%) — "
+                f"em jogo: {in_game} | erros: {errors} | "
+                f"ETA: ~{eta_s // 60}m{eta_s % 60:02d}s",
+                flush=True,
+            )
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     append_snapshot(ts, in_game, checked, len(challengers), len(gm_players))
 
-    print(f"[{ts}] {in_game}/{checked} jogadores em partida Flex agora. Salvo em {CSV_PATH}.")
+    print(f"", flush=True)
+    print(f"[{elapsed()}] ✅ Concluído!", flush=True)
+    print(f"[{elapsed()}] Jogadores em partida Flex agora: {in_game}/{checked}", flush=True)
+    print(f"[{elapsed()}] Erros/sem PUUID: {errors}", flush=True)
+    print(f"[{elapsed()}] Snapshot salvo em {CSV_PATH}", flush=True)
 
 
 if __name__ == "__main__":
